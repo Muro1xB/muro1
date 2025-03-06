@@ -1,0 +1,574 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const chalk = require('chalk');
+const inquirer = require('inquirer');
+const ora = require('ora');
+const boxen = require('boxen');
+const diskspace = require('diskspace');
+const qrcode = require('qrcode-terminal');
+const internal = require('internal-ip');
+const clear = require('clear');
+const figlet = require('figlet');
+
+// تعريف المجلد المؤقت للسيرفر
+const TEMP_DIR = path.join(process.cwd(), 'temp-server-storage');
+const MAX_SIZE_GB = 5;
+const MAX_SIZE_BYTES = MAX_SIZE_GB * 1024 * 1024 * 1024;
+
+// التأكد من وجود المجلد المؤقت
+function ensureTempDir() {
+  if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+  }
+}
+
+// حساب حجم المجلد
+function getDirSize(dirPath) {
+  let size = 0;
+  const files = fs.readdirSync(dirPath);
+  
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    const stats = fs.statSync(filePath);
+    
+    if (stats.isDirectory()) {
+      size += getDirSize(filePath);
+    } else {
+      size += stats.size;
+    }
+  }
+  
+  return size;
+}
+
+// تحويل البايت إلى وحدات مقروءة
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// إنشاء سيرفر Express
+function createServer(withWebpage = false) {
+  const app = express();
+  const port = 3000 + Math.floor(Math.random() * 2000);
+  
+  // إعداد المسارات الثابتة
+  app.use('/files', express.static(TEMP_DIR));
+  
+  // إضافة صفحة ويب إذا كان مطلوباً
+  if (withWebpage) {
+    app.get('/', (req, res) => {
+      const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+      
+      // إنشاء صفحة HTML تعرض IP العميل
+      const html = `
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>سيرفر مؤقت</title>
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              background-color: #f5f5f5;
+              margin: 0;
+              padding: 20px;
+              color: #333;
+              text-align: center;
+            }
+            .container {
+              max-width: 800px;
+              margin: 0 auto;
+              background: white;
+              padding: 20px;
+              border-radius: 10px;
+              box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+              color: #2c3e50;
+            }
+            .info-box {
+              background: #e8f4fc;
+              border-left: 4px solid #3498db;
+              padding: 15px;
+              margin: 20px 0;
+              text-align: right;
+              border-radius: 4px;
+            }
+            .file-list {
+              text-align: right;
+              margin-top: 20px;
+              padding: 10px;
+              background: #f9f9f9;
+              border-radius: 4px;
+            }
+            .file-item {
+              padding: 8px;
+              margin: 5px 0;
+              background: white;
+              border: 1px solid #eee;
+              border-radius: 4px;
+            }
+            .file-link {
+              color: #3498db;
+              text-decoration: none;
+            }
+            .file-link:hover {
+              text-decoration: underline;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>سيرفر مؤقت</h1>
+            <div class="info-box">
+              <p><strong>عنوان IP الخاص بك:</strong> ${clientIp}</p>
+              <p><strong>عنوان السيرفر:</strong> ${req.headers.host}</p>
+            </div>
+            <div class="file-list">
+              <h2>الملفات المتاحة:</h2>
+              ${listFilesAsHTML()}
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+      
+      res.send(html);
+    });
+  }
+  
+  // إضافة مسار لعرض معلومات العميل بتنسيق JSON
+  app.get('/info', (req, res) => {
+    const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    res.json({
+      clientIp,
+      serverHost: req.headers.host,
+      serverTime: new Date().toISOString()
+    });
+  });
+  
+  // بدء تشغيل السيرفر
+  return new Promise((resolve) => {
+    const server = app.listen(port, () => {
+      resolve({
+        server,
+        port,
+        url: `http://localhost:${port}`,
+        internalUrl: `http://${internal.v4.sync()}:${port}`
+      });
+    });
+  });
+}
+
+// إنشاء قائمة بالملفات بتنسيق HTML
+function listFilesAsHTML() {
+  try {
+    ensureTempDir();
+    const files = fs.readdirSync(TEMP_DIR);
+    
+    if (files.length === 0) {
+      return '<p>لا توجد ملفات حالياً.</p>';
+    }
+    
+    let fileListHtml = '';
+    files.forEach(file => {
+      const filePath = path.join(TEMP_DIR, file);
+      const stats = fs.statSync(filePath);
+      const fileSize = formatBytes(stats.size);
+      
+      fileListHtml += `
+        <div class="file-item">
+          <a href="/files/${file}" class="file-link">${file}</a> (${fileSize})
+        </div>
+      `;
+    });
+    
+    return fileListHtml;
+  } catch (error) {
+    console.error('خطأ في قراءة الملفات:', error);
+    return '<p>حدث خطأ في قراءة الملفات.</p>';
+  }
+}
+
+// عرض معلومات السيرفر
+function displayServerInfo(serverInfo, withWebpage) {
+  clear();
+  console.log(
+    chalk.blue(
+      figlet.textSync('Temp Server', { horizontalLayout: 'full' })
+    )
+  );
+  
+  const boxContent = `
+${chalk.green('✓')} السيرفر يعمل الآن!
+
+${chalk.yellow('معلومات الاتصال:')}
+${chalk.cyan('URL المحلي:')} ${serverInfo.url}
+${chalk.cyan('URL الشبكة:')} ${serverInfo.internalUrl}
+${chalk.cyan('المنفذ:')} ${serverInfo.port}
+
+${chalk.yellow('المسارات المتاحة:')}
+${chalk.cyan('الملفات:')} ${serverInfo.url}/files
+${chalk.cyan('معلومات العميل:')} ${serverInfo.url}/info
+${withWebpage ? chalk.cyan('الصفحة الرئيسية:') + ' ' + serverInfo.url : ''}
+
+${chalk.yellow('مجلد التخزين المؤقت:')}
+${chalk.cyan('المسار:')} ${TEMP_DIR}
+${chalk.cyan('الحجم المتاح:')} ${MAX_SIZE_GB} GB
+
+${chalk.red('اضغط Ctrl+C للخروج')}
+  `;
+  
+  console.log(boxen(boxContent, {
+    padding: 1,
+    margin: 1,
+    borderStyle: 'round',
+    borderColor: 'blue'
+  }));
+
+  console.log('\n');
+  console.log(chalk.yellow('مسح كود QR للوصول للسيرفر من الأجهزة الأخرى في نفس الشبكة:'));
+  qrcode.generate(serverInfo.internalUrl, {small: true});
+}
+
+// مراقبة حجم المجلد
+function monitorDiskUsage() {
+  setInterval(() => {
+    ensureTempDir();
+    const currentSize = getDirSize(TEMP_DIR);
+    const usedPercentage = (currentSize / MAX_SIZE_BYTES) * 100;
+    
+    if (usedPercentage > 85) {
+      console.log(chalk.yellow(`تحذير: تم استخدام ${usedPercentage.toFixed(2)}% من المساحة المخصصة (${formatBytes(currentSize)}/${MAX_SIZE_GB} GB)`));
+    }
+    
+    if (currentSize > MAX_SIZE_BYTES) {
+      console.log(chalk.red(`تحذير: تم تجاوز الحد الأقصى للمساحة المخصصة (${formatBytes(currentSize)})`));
+      console.log(chalk.yellow('يرجى حذف بعض الملفات لتحرير مساحة.'));
+    }
+  }, 30000); // فحص كل 30 ثانية
+}
+
+// القائمة الرئيسية
+async function mainMenu() {
+  clear();
+  console.log(
+    chalk.blue(
+      figlet.textSync('Temp Server', { horizontalLayout: 'full' })
+    )
+  );
+  
+  const spinner = ora('جاري التحقق من مساحة القرص...').start();
+  
+  // التحقق من مساحة القرص
+  diskspace.check('/', (err, result) => {
+    spinner.stop();
+    
+    if (err) {
+      console.error(chalk.red('خطأ في التحقق من مساحة القرص:'), err);
+      return;
+    }
+    
+    const freeSpaceGB = result.free / (1024 * 1024 * 1024);
+    
+    if (freeSpaceGB < MAX_SIZE_GB) {
+      console.log(chalk.red(`تحذير: المساحة الحرة على القرص (${freeSpaceGB.toFixed(2)} GB) أقل من المساحة المطلوبة (${MAX_SIZE_GB} GB)`));
+      console.log(chalk.yellow('قد لا يعمل السيرفر بشكل صحيح. يرجى تحرير بعض المساحة على القرص.'));
+    }
+    
+    // التحقق من المجلد المؤقت
+    ensureTempDir();
+    const currentSize = getDirSize(TEMP_DIR);
+    console.log(chalk.green(`المساحة المستخدمة حالياً: ${formatBytes(currentSize)} من ${MAX_SIZE_GB} GB`));
+    
+    // عرض القائمة
+    promptOptions();
+  });
+}
+
+// عرض خيارات القائمة
+async function promptOptions() {
+  const choices = [
+    {
+      name: 'إنشاء سيرفر مع صفحة ويب (يعرض عنوان IP للزائر)',
+      value: 'web'
+    },
+    {
+      name: 'إنشاء سيرفر بدون صفحة ويب (مجرد مشاركة الملفات)',
+      value: 'files'
+    },
+    {
+      name: 'إدارة الملفات في مجلد السيرفر',
+      value: 'manage'
+    },
+    {
+      name: 'خروج',
+      value: 'exit'
+    }
+  ];
+  
+  const answer = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'option',
+      message: 'اختر العملية التي تريد تنفيذها:',
+      choices: choices
+    }
+  ]);
+  
+  switch (answer.option) {
+    case 'web':
+      startServer(true);
+      break;
+    case 'files':
+      startServer(false);
+      break;
+    case 'manage':
+      manageFiles();
+      break;
+    case 'exit':
+      console.log(chalk.green('شكراً لاستخدام الأداة! مع السلامة.'));
+      process.exit(0);
+      break;
+  }
+}
+
+// بدء تشغيل السيرفر
+async function startServer(withWebpage) {
+  const spinner = ora('جاري بدء تشغيل السيرفر...').start();
+  
+  try {
+    const serverInfo = await createServer(withWebpage);
+    spinner.succeed('تم بدء تشغيل السيرفر بنجاح!');
+    
+    // عرض معلومات السيرفر
+    displayServerInfo(serverInfo, withWebpage);
+    
+    // بدء مراقبة استخدام المساحة
+    monitorDiskUsage();
+    
+    // الاستماع لإنهاء البرنامج
+    process.on('SIGINT', () => {
+      console.log(chalk.yellow('\nجاري إيقاف السيرفر...'));
+      serverInfo.server.close(() => {
+        console.log(chalk.green('تم إيقاف السيرفر بنجاح.'));
+        process.exit(0);
+      });
+    });
+  } catch (error) {
+    spinner.fail('فشل في بدء تشغيل السيرفر');
+    console.error(chalk.red('خطأ:'), error);
+    
+    setTimeout(() => {
+      mainMenu();
+    }, 3000);
+  }
+}
+
+// إدارة الملفات في مجلد السيرفر
+async function manageFiles() {
+  ensureTempDir();
+  const files = fs.readdirSync(TEMP_DIR);
+  const currentSize = getDirSize(TEMP_DIR);
+  
+  clear();
+  console.log(chalk.blue('== إدارة ملفات السيرفر المؤقت =='));
+  console.log(chalk.green(`المساحة المستخدمة حالياً: ${formatBytes(currentSize)} من ${MAX_SIZE_GB} GB`));
+  console.log(chalk.yellow(`عدد الملفات: ${files.length}`));
+  console.log('\n');
+  
+  if (files.length === 0) {
+    console.log(chalk.yellow('لا توجد ملفات في مجلد السيرفر.'));
+    
+    await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'action',
+        message: 'ماذا تريد أن تفعل؟',
+        choices: [
+          { name: 'العودة للقائمة الرئيسية', value: 'back' },
+          { name: 'إضافة ملفات', value: 'add' }
+        ]
+      }
+    ]).then(answer => {
+      if (answer.action === 'back') {
+        mainMenu();
+      } else {
+        addFiles();
+      }
+    });
+    
+    return;
+  }
+  
+  // عرض قائمة الملفات
+  const fileChoices = files.map(file => {
+    const filePath = path.join(TEMP_DIR, file);
+    const stats = fs.statSync(filePath);
+    return {
+      name: `${file} (${formatBytes(stats.size)})`,
+      value: file
+    };
+  });
+  
+  fileChoices.push({ name: 'حذف جميع الملفات', value: 'delete-all' });
+  fileChoices.push({ name: 'إضافة ملفات', value: 'add' });
+  fileChoices.push({ name: 'العودة للقائمة الرئيسية', value: 'back' });
+  
+  await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'file',
+      message: 'اختر ملفاً لإدارته أو اختر عملية أخرى:',
+      choices: fileChoices,
+      pageSize: 20
+    }
+  ]).then(async answer => {
+    if (answer.file === 'back') {
+      mainMenu();
+      return;
+    }
+    
+    if (answer.file === 'add') {
+      addFiles();
+      return;
+    }
+    
+    if (answer.file === 'delete-all') {
+      deleteAllFiles();
+      return;
+    }
+    
+    // إدارة ملف محدد
+    const filePath = path.join(TEMP_DIR, answer.file);
+    const stats = fs.statSync(filePath);
+    
+    console.log('\n');
+    console.log(chalk.blue(`== إدارة الملف: ${answer.file} ==`));
+    console.log(chalk.green(`الحجم: ${formatBytes(stats.size)}`));
+    console.log(chalk.yellow(`تاريخ التعديل: ${stats.mtime}`));
+    console.log('\n');
+    
+    await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'action',
+        message: 'ماذا تريد أن تفعل بهذا الملف؟',
+        choices: [
+          { name: 'حذف الملف', value: 'delete' },
+          { name: 'العودة لقائمة الملفات', value: 'back' },
+          { name: 'العودة للقائمة الرئيسية', value: 'main' }
+        ]
+      }
+    ]).then(actionAnswer => {
+      if (actionAnswer.action === 'delete') {
+        try {
+          fs.unlinkSync(filePath);
+          console.log(chalk.green(`تم حذف الملف ${answer.file} بنجاح.`));
+        } catch (error) {
+          console.error(chalk.red('خطأ في حذف الملف:'), error);
+        }
+        
+        setTimeout(() => {
+          manageFiles();
+        }, 1500);
+      } else if (actionAnswer.action === 'back') {
+        manageFiles();
+      } else {
+        mainMenu();
+      }
+    });
+  });
+}
+
+// إضافة ملفات
+function addFiles() {
+  console.log(chalk.yellow('لإضافة ملفات، قم بنسخها يدوياً إلى المجلد التالي:'));
+  console.log(chalk.cyan(TEMP_DIR));
+  console.log(chalk.green('ملاحظة: يمكنك سحب وإفلات الملفات في هذا المجلد.'));
+  
+  inquirer.prompt([
+    {
+      type: 'list',
+      name: 'action',
+      message: 'ماذا تريد أن تفعل الآن؟',
+      choices: [
+        { name: 'فتح مجلد السيرفر', value: 'open' },
+        { name: 'العودة لإدارة الملفات', value: 'manage' },
+        { name: 'العودة للقائمة الرئيسية', value: 'main' }
+      ]
+    }
+  ]).then(answer => {
+    if (answer.action === 'open') {
+      try {
+        // فتح المجلد باستخدام الأمر المناسب للنظام
+        const command = process.platform === 'win32' ? 'explorer' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+        require('child_process').exec(`${command} "${TEMP_DIR}"`);
+        
+        setTimeout(() => {
+          manageFiles();
+        }, 1000);
+      } catch (error) {
+        console.error(chalk.red('خطأ في فتح المجلد:'), error);
+        setTimeout(() => {
+          manageFiles();
+        }, 1500);
+      }
+    } else if (answer.action === 'manage') {
+      manageFiles();
+    } else {
+      mainMenu();
+    }
+  });
+}
+
+// حذف جميع الملفات
+function deleteAllFiles() {
+  inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'confirm',
+      message: 'هل أنت متأكد من حذف جميع الملفات؟ هذا الإجراء لا يمكن التراجع عنه.',
+      default: false
+    }
+  ]).then(answer => {
+    if (answer.confirm) {
+      const spinner = ora('جاري حذف جميع الملفات...').start();
+      
+      try {
+        const files = fs.readdirSync(TEMP_DIR);
+        
+        files.forEach(file => {
+          const filePath = path.join(TEMP_DIR, file);
+          fs.unlinkSync(filePath);
+        });
+        
+        spinner.succeed(`تم حذف ${files.length} ملف بنجاح.`);
+      } catch (error) {
+        spinner.fail('فشل في حذف الملفات');
+        console.error(chalk.red('خطأ:'), error);
+      }
+      
+      setTimeout(() => {
+        manageFiles();
+      }, 1500);
+    } else {
+      manageFiles();
+    }
+  });
+}
+
+// بدء تنفيذ البرنامج
+mainMenu();
